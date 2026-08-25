@@ -153,191 +153,31 @@ jobs:
             echo "error=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create or update sticky review comments
+      - name: Publish upstream Alibaba OCR review
         if: always()
-        uses: actions/github-script@v7
-        env:
-          OCR_MODEL: ${{ secrets.OCR_LLM_MODEL }}
-          REVIEWED_FILES_PATH: ${{ runner.temp }}/ocr-reviewed-files.txt
-          UPSTREAM_RESULT_PATH: ${{ runner.temp }}/upstream-ocr.json
-          UPSTREAM_STATUS: ${{ steps.upstream.outputs.status }}
-          UPSTREAM_ERROR: ${{ steps.upstream.outputs.error }}
-          INHOUSE_RESULT_PATH: ${{ github.workspace }}/.ocr-results/inhouse-ocr.json
-          INHOUSE_STATUS: ${{ steps.inhouse.outputs.status }}
-          INHOUSE_ERROR: ${{ steps.inhouse.outputs.error }}
+        uses: ameen-io/open-code-review/actions/coznt-pr-review@vendor/v1.10.0
         with:
-          github-token: ${{ github.token }}
-          script: |
-            const fs = require('fs');
+          title: Upstream Alibaba OCR
+          marker: '<!-- upstream-alibaba-ocr -->'
+          result_path: ${{ runner.temp }}/upstream-ocr.json
+          reviewed_files_path: ${{ runner.temp }}/ocr-reviewed-files.txt
+          review_status: ${{ steps.upstream.outputs.status }}
+          review_error: ${{ steps.upstream.outputs.error }}
+          model: ${{ secrets.OCR_LLM_MODEL }}
+          github_token: ${{ github.token }}
 
-            const prNumber = context.payload.pull_request.number;
-            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
-
-            const cleanInline = (value) => String(value ?? '')
-              .replace(/<!--/g, '&lt;!--')
-              .replace(/-->/g, '--&gt;')
-              .replace(/\s+/g, ' ')
-              .trim();
-
-            const code = (value) => `\`${cleanInline(value).replace(/`/g, "'")}\``;
-
-            const files = fs.existsSync(process.env.REVIEWED_FILES_PATH)
-              ? fs.readFileSync(process.env.REVIEWED_FILES_PATH, 'utf8')
-                  .split(/\r?\n/)
-                  .filter(Boolean)
-              : [];
-
-            function parseReview(resultPath, status, error) {
-              if (status !== 'success') {
-                return {
-                  succeeded: false,
-                  error: cleanInline(error || 'Reviewer did not complete.'),
-                  findings: [],
-                };
-              }
-
-              try {
-                const parsed = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
-                const findings = Array.isArray(parsed?.comments)
-                  ? parsed.comments
-                  : Array.isArray(parsed)
-                    ? parsed
-                    : Array.isArray(parsed?.result?.comments)
-                      ? parsed.result.comments
-                      : [];
-                return { succeeded: true, findings };
-              } catch (error) {
-                return {
-                  succeeded: false,
-                  error: `Could not parse reviewer JSON: ${cleanInline(error.message)}`,
-                  findings: [],
-                };
-              }
-            }
-
-            function findingLine(finding) {
-              const start = finding.start_line ?? finding.startLine;
-              const end = finding.end_line ?? finding.endLine ?? finding.line;
-              if (start && end && start !== end) return `${start}-${end}`;
-              return String(end || start || finding.position || 'n/a');
-            }
-
-            function findingText(finding) {
-              const text = finding.content
-                ?? finding.body
-                ?? finding.text
-                ?? finding.message
-                ?? finding.description
-                ?? 'No finding text returned.';
-              const cleaned = cleanInline(text);
-              return cleaned.length > 1000 ? `${cleaned.slice(0, 997)}...` : cleaned;
-            }
-
-            function renderComment({ marker, title, review }) {
-              const lines = [marker, `## ${title}`, ''];
-              lines.push(`- **Review status:** ${review.succeeded ? 'Succeeded' : 'Failed'}`);
-              lines.push(`- **Model:** ${code(process.env.OCR_MODEL || 'Not configured')}`);
-              lines.push(review.succeeded
-                ? `- **Files reviewed:** ${files.length}`
-                : `- **Files reviewed:** Unknown (requested diff contains ${files.length})`);
-              lines.push(review.succeeded
-                ? `- **Finding count:** ${review.findings.length}`
-                : '- **Finding count:** Unknown');
-
-              if (!review.succeeded) {
-                lines.push('', `**Error:** ${review.error}`);
-              } else if (review.findings.length === 0) {
-                lines.push('', 'No findings returned.');
-              } else {
-                lines.push('', '### Findings', '');
-                for (const [index, finding] of review.findings.slice(0, 10).entries()) {
-                  const file = finding.path ?? finding.file ?? finding.filename ?? 'unknown file';
-                  lines.push(`${index + 1}. ${code(file)}:${code(findingLine(finding))} — ${findingText(finding)}`);
-                }
-                if (review.findings.length > 10) {
-                  lines.push('', `_Showing 10 of ${review.findings.length} findings._`);
-                }
-              }
-
-              lines.push('', `<details><summary>Files in reviewed diff (${files.length})</summary>`, '');
-              if (files.length === 0) {
-                lines.push('_No changed files._');
-              } else {
-                for (const file of files.slice(0, 100)) lines.push(`- ${code(file)}`);
-                if (files.length > 100) lines.push(`- _...and ${files.length - 100} more._`);
-              }
-              lines.push('', '</details>', '', `[Workflow run](${runUrl})`);
-              return lines.join('\n');
-            }
-
-            const reviews = [
-              {
-                marker: '<!-- upstream-alibaba-ocr -->',
-                title: 'Upstream Alibaba OCR',
-                review: parseReview(
-                  process.env.UPSTREAM_RESULT_PATH,
-                  process.env.UPSTREAM_STATUS,
-                  process.env.UPSTREAM_ERROR,
-                ),
-              },
-              {
-                marker: '<!-- inhouse-ocr-image -->',
-                title: 'In-house OCR image',
-                review: parseReview(
-                  process.env.INHOUSE_RESULT_PATH,
-                  process.env.INHOUSE_STATUS,
-                  process.env.INHOUSE_ERROR,
-                ),
-              },
-            ];
-
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: prNumber,
-              per_page: 100,
-            });
-
-            const postingErrors = [];
-            for (const definition of reviews) {
-              try {
-                const matches = comments
-                  .filter((comment) => comment.user?.type === 'Bot'
-                    && comment.body?.startsWith(definition.marker))
-                  .sort((a, b) => a.id - b.id);
-                const body = renderComment(definition);
-
-                if (matches.length > 0) {
-                  await github.rest.issues.updateComment({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    comment_id: matches[0].id,
-                    body,
-                  });
-                } else {
-                  await github.rest.issues.createComment({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    issue_number: prNumber,
-                    body,
-                  });
-                }
-
-                for (const duplicate of matches.slice(1)) {
-                  await github.rest.issues.deleteComment({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    comment_id: duplicate.id,
-                  });
-                }
-              } catch (error) {
-                postingErrors.push(`${definition.title}: ${error.message}`);
-              }
-            }
-
-            if (postingErrors.length > 0) {
-              core.setFailed(`Failed to maintain one or more sticky comments: ${postingErrors.join('; ')}`);
-            }
+      - name: Publish Coznt PR review
+        if: always()
+        uses: ameen-io/open-code-review/actions/coznt-pr-review@vendor/v1.10.0
+        with:
+          title: Coznt PR Review
+          marker: '<!-- inhouse-ocr-image -->'
+          result_path: ${{ github.workspace }}/.ocr-results/inhouse-ocr.json
+          reviewed_files_path: ${{ runner.temp }}/ocr-reviewed-files.txt
+          review_status: ${{ steps.inhouse.outputs.status }}
+          review_error: ${{ steps.inhouse.outputs.error }}
+          model: ${{ secrets.OCR_LLM_MODEL }}
+          github_token: ${{ github.token }}
 
       - name: Fail the job if a reviewer failed
         if: >-

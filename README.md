@@ -25,6 +25,8 @@ npm.cmd run dev
 
 Use `npm.cmd run build` to create the production bundle in `dist/`.
 
+See [ROADMAP.md](ROADMAP.md) for the ten-version delivery plan and [AGENTS.md](AGENTS.md) for the required `dev`-based branch workflow.
+
 ## Suggested next increments
 
 1. Define the project and document-source data model.

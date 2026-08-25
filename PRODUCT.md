@@ -8,7 +8,7 @@ web
 
 ## Stack
 
-delegated: Vite with vanilla HTML, CSS, and JavaScript, chosen to keep the initial commit small and reversible without committing to a component framework.
+Vite, React, and TypeScript for the web application foundation.
 
 ## Users
 

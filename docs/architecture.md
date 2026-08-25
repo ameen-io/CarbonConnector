@@ -1,6 +1,6 @@
 # v1 Skeleton Architecture
 
-This repository intentionally contains only a Vite-powered vanilla JavaScript application shell. It establishes the future product boundary without selecting services, vendors, or data-processing approaches.
+This repository currently contains a Vite, React, and TypeScript application foundation. It establishes frontend routes, states, and domain contracts without selecting backend services, vendors, or data-processing approaches.
 
 ## Future workflow boundary
 
@@ -19,13 +19,13 @@ Integration map | API inventory | Auth model | Schema mapping | Data model | Ris
 
 ## Suggested domain areas
 
-| Area | Responsibility | Not implemented in v1 |
-| --- | --- | --- |
-| Projects | Groups a customer engagement and its outputs. | Storage and access controls |
-| Sources | Represents uploaded documents and connected knowledge bases. | Uploads, Confluence access, sync |
-| Connections | Represents approved API or platform access. | OAuth, secrets, credential persistence |
-| Evidence | Keeps references between source material and technical findings. | Extraction and citations |
-| Analysis | Produces and reviews the six technical output views. | Parsing, generation, approval workflow |
+| Area        | Responsibility                                                   | Not implemented in v1                  |
+| ----------- | ---------------------------------------------------------------- | -------------------------------------- |
+| Projects    | Groups a customer engagement and its outputs.                    | Storage and access controls            |
+| Sources     | Represents uploaded documents and connected knowledge bases.     | Uploads, Confluence access, sync       |
+| Connections | Represents approved API or platform access.                      | OAuth, secrets, credential persistence |
+| Evidence    | Keeps references between source material and technical findings. | Extraction and citations               |
+| Analysis    | Produces and reviews the six technical output views.             | Parsing, generation, approval workflow |
 
 ## Non-negotiable future boundaries
 

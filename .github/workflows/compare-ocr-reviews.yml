@@ -1,0 +1,350 @@
+name: Compare OCR reviews
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  packages: read
+
+concurrency:
+  group: compare-ocr-reviews-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: Compare OCR reviewers
+    runs-on: ubuntu-latest
+
+    steps:
+      # Only materialize the trusted base revision. The PR head is fetched below as
+      # Git objects and is never checked out or executed.
+      - name: Check out trusted base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch PR head and resolve review range
+        id: range
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]
+
+          git fetch --no-tags origin \
+            "+refs/pull/${PR_NUMBER}/head:refs/remotes/origin/ocr-pr-${PR_NUMBER}"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+
+          merge_base="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+          echo "merge_base=$merge_base" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+
+          git -c core.quotePath=false diff --name-only \
+            "$merge_base" "$HEAD_SHA" > "$RUNNER_TEMP/ocr-reviewed-files.txt"
+
+          echo "Reviewing merge-base $merge_base through head $HEAD_SHA"
+
+      - name: Run upstream Alibaba OCR
+        id: upstream
+        shell: bash
+        env:
+          MERGE_BASE: ${{ steps.range.outputs.merge_base }}
+          HEAD_SHA: ${{ steps.range.outputs.head_sha }}
+          OCR_LLM_URL: ${{ secrets.OCR_LLM_URL }}
+          OCR_LLM_TOKEN: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
+          OCR_LLM_MODEL: ${{ secrets.OCR_LLM_MODEL }}
+          OCR_USE_ANTHROPIC: ${{ secrets.OCR_LLM_USE_ANTHROPIC }}
+        run: |
+          set +e
+
+          npm install -g @alibaba-group/open-code-review@1.10.0 \
+            > "$RUNNER_TEMP/upstream-ocr-install.log" 2>&1
+          install_code=$?
+
+          if [ "$install_code" -ne 0 ]; then
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+            echo "error=CLI installation failed with exit code $install_code." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ocr review \
+            --from "$MERGE_BASE" \
+            --to "$HEAD_SHA" \
+            --audience agent \
+            --format json \
+            > "$RUNNER_TEMP/upstream-ocr.json" \
+            2> "$RUNNER_TEMP/upstream-ocr.stderr"
+          review_code=$?
+
+          if [ "$review_code" -ne 0 ]; then
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+            echo "error=OCR review failed with exit code $review_code." >> "$GITHUB_OUTPUT"
+          elif ! jq -e . "$RUNNER_TEMP/upstream-ocr.json" > /dev/null 2>&1; then
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+            echo "error=OCR returned invalid JSON." >> "$GITHUB_OUTPUT"
+          else
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "error=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run in-house OCR image
+        id: inhouse
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GHCR_ACTOR: ${{ github.actor }}
+          MERGE_BASE: ${{ steps.range.outputs.merge_base }}
+          HEAD_SHA: ${{ steps.range.outputs.head_sha }}
+          OCR_LLM_URL: ${{ secrets.OCR_LLM_URL }}
+          OCR_LLM_TOKEN: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
+          OCR_LLM_MODEL: ${{ secrets.OCR_LLM_MODEL }}
+          OCR_USE_ANTHROPIC: ${{ secrets.OCR_LLM_USE_ANTHROPIC }}
+        run: |
+          set +e
+
+          mkdir -p "$GITHUB_WORKSPACE/.ocr-results"
+
+          printf '%s' "$GITHUB_TOKEN" | \
+            docker login ghcr.io --username "$GHCR_ACTOR" --password-stdin \
+              > "$RUNNER_TEMP/inhouse-ocr-login.log" 2>&1
+          login_code=${PIPESTATUS[1]}
+
+          if [ "$login_code" -ne 0 ]; then
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+            echo "error=GHCR login failed with exit code $login_code." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/repo:ro" \
+            --workdir /repo \
+            --env OCR_LLM_URL \
+            --env OCR_LLM_TOKEN \
+            --env OCR_LLM_MODEL \
+            --env OCR_USE_ANTHROPIC \
+            --env MERGE_BASE \
+            --env HEAD_SHA \
+            --entrypoint /bin/sh \
+            ghcr.io/ameen-io/ocr-reviewer:v1.10.0 \
+            -c 'export HOME=/tmp/ocr-home; mkdir -p "$HOME"; git config --global --add safe.directory /repo && exec ocr review --from "$MERGE_BASE" --to "$HEAD_SHA" --audience agent --format json' \
+            > "$GITHUB_WORKSPACE/.ocr-results/inhouse-ocr.json" \
+            2> "$RUNNER_TEMP/inhouse-ocr.stderr"
+          review_code=$?
+
+          if [ "$review_code" -ne 0 ]; then
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+            echo "error=Containerized OCR review failed with exit code $review_code." >> "$GITHUB_OUTPUT"
+          elif ! jq -e . "$GITHUB_WORKSPACE/.ocr-results/inhouse-ocr.json" > /dev/null 2>&1; then
+            echo "status=failure" >> "$GITHUB_OUTPUT"
+            echo "error=Containerized OCR returned invalid JSON." >> "$GITHUB_OUTPUT"
+          else
+            echo "status=success" >> "$GITHUB_OUTPUT"
+            echo "error=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or update sticky review comments
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          OCR_MODEL: ${{ secrets.OCR_LLM_MODEL }}
+          REVIEWED_FILES_PATH: ${{ runner.temp }}/ocr-reviewed-files.txt
+          UPSTREAM_RESULT_PATH: ${{ runner.temp }}/upstream-ocr.json
+          UPSTREAM_STATUS: ${{ steps.upstream.outputs.status }}
+          UPSTREAM_ERROR: ${{ steps.upstream.outputs.error }}
+          INHOUSE_RESULT_PATH: ${{ github.workspace }}/.ocr-results/inhouse-ocr.json
+          INHOUSE_STATUS: ${{ steps.inhouse.outputs.status }}
+          INHOUSE_ERROR: ${{ steps.inhouse.outputs.error }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+
+            const prNumber = context.payload.pull_request.number;
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+
+            const cleanInline = (value) => String(value ?? '')
+              .replace(/<!--/g, '&lt;!--')
+              .replace(/-->/g, '--&gt;')
+              .replace(/\s+/g, ' ')
+              .trim();
+
+            const code = (value) => `\`${cleanInline(value).replace(/`/g, "'")}\``;
+
+            const files = fs.existsSync(process.env.REVIEWED_FILES_PATH)
+              ? fs.readFileSync(process.env.REVIEWED_FILES_PATH, 'utf8')
+                  .split(/\r?\n/)
+                  .filter(Boolean)
+              : [];
+
+            function parseReview(resultPath, status, error) {
+              if (status !== 'success') {
+                return {
+                  succeeded: false,
+                  error: cleanInline(error || 'Reviewer did not complete.'),
+                  findings: [],
+                };
+              }
+
+              try {
+                const parsed = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
+                const findings = Array.isArray(parsed?.comments)
+                  ? parsed.comments
+                  : Array.isArray(parsed)
+                    ? parsed
+                    : Array.isArray(parsed?.result?.comments)
+                      ? parsed.result.comments
+                      : [];
+                return { succeeded: true, findings };
+              } catch (error) {
+                return {
+                  succeeded: false,
+                  error: `Could not parse reviewer JSON: ${cleanInline(error.message)}`,
+                  findings: [],
+                };
+              }
+            }
+
+            function findingLine(finding) {
+              const start = finding.start_line ?? finding.startLine;
+              const end = finding.end_line ?? finding.endLine ?? finding.line;
+              if (start && end && start !== end) return `${start}-${end}`;
+              return String(end || start || finding.position || 'n/a');
+            }
+
+            function findingText(finding) {
+              const text = finding.content
+                ?? finding.body
+                ?? finding.text
+                ?? finding.message
+                ?? finding.description
+                ?? 'No finding text returned.';
+              const cleaned = cleanInline(text);
+              return cleaned.length > 1000 ? `${cleaned.slice(0, 997)}...` : cleaned;
+            }
+
+            function renderComment({ marker, title, review }) {
+              const lines = [marker, `## ${title}`, ''];
+              lines.push(`- **Review status:** ${review.succeeded ? 'Succeeded' : 'Failed'}`);
+              lines.push(`- **Model:** ${code(process.env.OCR_MODEL || 'Not configured')}`);
+              lines.push(review.succeeded
+                ? `- **Files reviewed:** ${files.length}`
+                : `- **Files reviewed:** Unknown (requested diff contains ${files.length})`);
+              lines.push(review.succeeded
+                ? `- **Finding count:** ${review.findings.length}`
+                : '- **Finding count:** Unknown');
+
+              if (!review.succeeded) {
+                lines.push('', `**Error:** ${review.error}`);
+              } else if (review.findings.length === 0) {
+                lines.push('', 'No findings returned.');
+              } else {
+                lines.push('', '### Findings', '');
+                for (const [index, finding] of review.findings.slice(0, 10).entries()) {
+                  const file = finding.path ?? finding.file ?? finding.filename ?? 'unknown file';
+                  lines.push(`${index + 1}. ${code(file)}:${code(findingLine(finding))} — ${findingText(finding)}`);
+                }
+                if (review.findings.length > 10) {
+                  lines.push('', `_Showing 10 of ${review.findings.length} findings._`);
+                }
+              }
+
+              lines.push('', `<details><summary>Files in reviewed diff (${files.length})</summary>`, '');
+              if (files.length === 0) {
+                lines.push('_No changed files._');
+              } else {
+                for (const file of files.slice(0, 100)) lines.push(`- ${code(file)}`);
+                if (files.length > 100) lines.push(`- _...and ${files.length - 100} more._`);
+              }
+              lines.push('', '</details>', '', `[Workflow run](${runUrl})`);
+              return lines.join('\n');
+            }
+
+            const reviews = [
+              {
+                marker: '<!-- upstream-alibaba-ocr -->',
+                title: 'Upstream Alibaba OCR',
+                review: parseReview(
+                  process.env.UPSTREAM_RESULT_PATH,
+                  process.env.UPSTREAM_STATUS,
+                  process.env.UPSTREAM_ERROR,
+                ),
+              },
+              {
+                marker: '<!-- inhouse-ocr-image -->',
+                title: 'In-house OCR image',
+                review: parseReview(
+                  process.env.INHOUSE_RESULT_PATH,
+                  process.env.INHOUSE_STATUS,
+                  process.env.INHOUSE_ERROR,
+                ),
+              },
+            ];
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+
+            const postingErrors = [];
+            for (const definition of reviews) {
+              try {
+                const matches = comments
+                  .filter((comment) => comment.user?.type === 'Bot'
+                    && comment.body?.startsWith(definition.marker))
+                  .sort((a, b) => a.id - b.id);
+                const body = renderComment(definition);
+
+                if (matches.length > 0) {
+                  await github.rest.issues.updateComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    comment_id: matches[0].id,
+                    body,
+                  });
+                } else {
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: prNumber,
+                    body,
+                  });
+                }
+
+                for (const duplicate of matches.slice(1)) {
+                  await github.rest.issues.deleteComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    comment_id: duplicate.id,
+                  });
+                }
+              } catch (error) {
+                postingErrors.push(`${definition.title}: ${error.message}`);
+              }
+            }
+
+            if (postingErrors.length > 0) {
+              core.setFailed(`Failed to maintain one or more sticky comments: ${postingErrors.join('; ')}`);
+            }
+
+      - name: Fail the job if a reviewer failed
+        if: >-
+          always() &&
+          (steps.upstream.outputs.status != 'success' ||
+          steps.inhouse.outputs.status != 'success')
+        shell: bash
+        run: |
+          echo "One or more OCR reviewers failed; their sticky comments contain the status."
+          exit 1

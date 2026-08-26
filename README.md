@@ -4,7 +4,7 @@ A deliberately small starting point for an FDE workflow that turns customer docu
 
 ## What is here
 
-- A minimal Vite workspace shell.
+- A Vite, React, and TypeScript application foundation.
 - A first-run empty state for the workflow: documentation, access, and analysis.
 - Placeholders for the six intended outputs: integration map, API inventory, auth model, schema mapping, data model, and potential risks.
 - Product and architecture notes so future work has a clear boundary.
@@ -24,6 +24,15 @@ npm.cmd run dev
 ```
 
 Use `npm.cmd run build` to create the production bundle in `dist/`.
+
+Quality checks:
+
+```powershell
+npm.cmd run lint
+npm.cmd run typecheck
+npm.cmd run test
+npm.cmd run format:check
+```
 
 See [ROADMAP.md](ROADMAP.md) for the ten-version delivery plan and [AGENTS.md](AGENTS.md) for the required `dev`-based branch workflow.
 
